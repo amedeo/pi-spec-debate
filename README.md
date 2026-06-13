@@ -1,6 +1,10 @@
 # pi-spec-debate
 
-A Pi package for running a small multi-model debate over a markdown feasibility/spec document until it reaches consensus, stalls, or needs explicit user direction.
+[![Version](https://img.shields.io/badge/version-0.1.0-blue)](./package.json)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+[![Pi package](https://img.shields.io/badge/pi-package-purple)](https://pi.dev)
+
+Run a structured skeptic/builder/judge debate over a markdown spec in Pi until it reaches consensus, stalls, or needs explicit user direction.
 
 ## What it adds
 
@@ -14,12 +18,23 @@ The workflow runs three isolated Pi subprocesses per round:
 - **builder**: rewrites the document
 - **judge**: decides whether the revised draft is good enough to stop or whether it needs explicit user direction
 
+## Why use this?
+
+Use `pi-spec-debate` when a single-pass review is not enough and you want a tighter loop between critique, revision, and stop/go judgment.
+
+It is especially useful for:
+
+- early RFCs and idea docs
+- feasibility notes with hidden assumptions
+- execution plans that need sharper scope and rollout detail
+- specs that may require explicit owner decisions instead of silent model guesswork
+
 ## Install
 
-From a git repo:
+From the git repo:
 
 ```bash
-pi install git:github.com/you/pi-spec-debate
+pi install git:github.com/amedeo/pi-spec-debate
 ```
 
 Or from a local checkout while iterating:
@@ -51,6 +66,19 @@ Typical outputs:
 - `debate.md` — full round-by-round log
 - `round-01-*.md/json` — per-round artifacts
 - `round-01-user.md` — user direction requested or provided in that round, when applicable
+
+Example output tree:
+
+```text
+idea.spec-debate/
+├── final.md
+├── consensus.md
+├── debate.md
+├── round-01-skeptic.md
+├── round-01-builder.md
+├── round-01-judge.json
+└── round-01-user.md
+```
 
 In interactive TUI/RPC use, the debate can pause mid-run to ask the user for architectural, technical, design, product, or rollout direction, then continue with that answer integrated into the spec. In non-interactive mode, it stops with `needs-user-input` and writes the pending questions to disk.
 
@@ -121,3 +149,14 @@ Per-command arguments override config.
 - Child subprocesses support per-role timeouts, a per-round timeout, and SIGTERM→SIGKILL escalation on cancellation.
 - This package is designed to work the same way on Linux and macOS.
 - The child `pi` executable must be available on your `PATH`.
+
+## Release history
+
+### v0.1.0
+
+- initial `spec_debate` tool and `/spec-debate` command
+- skeptic / builder / judge debate loop
+- structured user-direction checkpoints
+- round artifacts written to disk
+- per-role and per-round subprocess timeouts
+- optional child `web_search` support for skeptic/judge when available

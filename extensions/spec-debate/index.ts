@@ -459,16 +459,18 @@ function envConfig(): Partial<DebateConfig> {
   if (process.env.PI_SPEC_DEBATE_BUILDER_MODEL) models.builder = process.env.PI_SPEC_DEBATE_BUILDER_MODEL;
   if (process.env.PI_SPEC_DEBATE_JUDGE_MODEL) models.judge = process.env.PI_SPEC_DEBATE_JUDGE_MODEL;
 
+  const timeouts = filterDefined({
+    skepticMs: parseOptionalInt(process.env.PI_SPEC_DEBATE_SKEPTIC_TIMEOUT_MS),
+    builderMs: parseOptionalInt(process.env.PI_SPEC_DEBATE_BUILDER_TIMEOUT_MS),
+    judgeMs: parseOptionalInt(process.env.PI_SPEC_DEBATE_JUDGE_TIMEOUT_MS),
+    roundMs: parseOptionalInt(process.env.PI_SPEC_DEBATE_ROUND_TIMEOUT_MS),
+    terminateGraceMs: parseOptionalInt(process.env.PI_SPEC_DEBATE_TERMINATE_GRACE_MS),
+  });
+
   return {
     maxRounds: parseOptionalInt(process.env.PI_SPEC_DEBATE_MAX_ROUNDS),
     models,
-    timeouts: {
-      skepticMs: parseOptionalInt(process.env.PI_SPEC_DEBATE_SKEPTIC_TIMEOUT_MS),
-      builderMs: parseOptionalInt(process.env.PI_SPEC_DEBATE_BUILDER_TIMEOUT_MS),
-      judgeMs: parseOptionalInt(process.env.PI_SPEC_DEBATE_JUDGE_TIMEOUT_MS),
-      roundMs: parseOptionalInt(process.env.PI_SPEC_DEBATE_ROUND_TIMEOUT_MS),
-      terminateGraceMs: parseOptionalInt(process.env.PI_SPEC_DEBATE_TERMINATE_GRACE_MS),
-    } as Partial<DebateTimeoutConfig>,
+    timeouts: Object.keys(timeouts).length > 0 ? timeouts : undefined,
     childTools: {
       enableWebSearch: parseOptionalBoolean(process.env.PI_SPEC_DEBATE_ENABLE_WEB_SEARCH),
       webSearchToolNames: parseOptionalList(process.env.PI_SPEC_DEBATE_WEB_SEARCH_TOOLS),
@@ -507,7 +509,7 @@ function mergeConfig(base: DebateConfig, override: Partial<DebateConfig> | undef
     },
     timeouts: {
       ...base.timeouts,
-      ...(override.timeouts ?? {}),
+      ...filterDefined(override.timeouts ?? {}),
     },
     childTools: {
       enableWebSearch: override.childTools?.enableWebSearch ?? base.childTools.enableWebSearch,
@@ -521,6 +523,12 @@ function mergeConfig(base: DebateConfig, override: Partial<DebateConfig> | undef
           : [...base.childTools.webSearchRoles],
     },
   };
+}
+
+function filterDefined<T extends Record<string, unknown>>(obj: T): Partial<T> {
+  return Object.fromEntries(
+    Object.entries(obj).filter(([_, v]) => v !== undefined),
+  ) as Partial<T>;
 }
 
 function parseOptionalInt(value: string | undefined): number | undefined {

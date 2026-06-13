@@ -1,7 +1,7 @@
 {
   "name": "pi-spec-debate",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "description": "Multi-model spec debate workflow for Pi",
   "keywords": ["pi-package"],
   "pi": {
