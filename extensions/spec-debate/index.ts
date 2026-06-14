@@ -337,8 +337,9 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
                 responses,
                 pendingQuestions: [],
               };
+              await writeUserDecisionRoundFile(outputDir, round, userDecision);
 
-              setStatus(ctx, `round ${round}/${maxRounds}: integrating user direction`);
+              setStatus(ctx, `round ${round}/${maxRounds}: integrating user direction after timeout reset`);
               revisedSpec = stripWrappingCodeFence(
                 await runRole({
                   cwd: path.dirname(specPath),
@@ -1071,8 +1072,13 @@ async function writeRoundFiles(outputDir: string, round: DebateRound) {
   await writeFile(path.join(outputDir, `${prefix}-judge.json`), JSON.stringify(round.judge, null, 2) + "\n", "utf8");
 
   if (round.userDecision) {
-    await writeFile(path.join(outputDir, `${prefix}-user.md`), buildUserDecisionRoundFile(round.userDecision), "utf8");
+    await writeUserDecisionRoundFile(outputDir, round.round, round.userDecision);
   }
+}
+
+async function writeUserDecisionRoundFile(outputDir: string, round: number, userDecision: UserDecisionState) {
+  const prefix = `round-${String(round).padStart(2, "0")}`;
+  await writeFile(path.join(outputDir, `${prefix}-user.md`), buildUserDecisionRoundFile(userDecision), "utf8");
 }
 
 function buildUserDecisionRoundFile(userDecision: UserDecisionState): string {
