@@ -41,6 +41,11 @@ interface DebateOverrides {
   models?: Partial<Record<RoleName, string>>;
   availableToolNames?: string[];
   signal?: AbortSignal;
+  onProgress?: (message: string) => void;
+}
+
+interface DebateProgressTracker {
+  lines: string[];
 }
 
 interface DebateRoleExecutionConfig {
@@ -196,7 +201,7 @@ export default function (pi: ExtensionAPI) {
       "spec_debate may ask the user for direction when the debate reaches an architectural, technical, design, product, or rollout choice that should not be invented.",
     ],
     parameters: TOOL_SCHEMA,
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const result = await runDebate(params.path, ctx, {
         rounds: params.rounds,
         outputDir: params.outputDir,
@@ -207,6 +212,12 @@ export default function (pi: ExtensionAPI) {
         },
         availableToolNames: pi.getAllTools().map((tool) => tool.name),
         signal,
+        onProgress: (message) => {
+          onUpdate?.({
+            content: [{ type: "text", text: message }],
+            details: { status: "running", current: message },
+          });
+        },
       });
 
       return {
@@ -257,8 +268,9 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
   let currentSpec = sourceText.trimEnd() + "\n";
   const rounds: DebateRound[] = [];
   let status: DebateStatus = "max-rounds";
+  const progress = createProgressTracker();
 
-  setStatus(ctx, `starting ${path.basename(specPath)}`);
+  reportProgress(ctx, progress, `starting ${path.basename(specPath)}`, overrides);
 
   try {
     for (let round = 1; round <= maxRounds; round++) {
@@ -269,15 +281,17 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
         roundControl.dispose();
         roundControl = createTimeoutAbortControl(config.timeouts.roundMs, `debate round ${round}`);
         roundSignal = combineAbortSignals([overrides.signal, roundControl.signal]);
+        reportProgress(ctx, progress, `round ${round}/${maxRounds}: timeout reset after user direction`, overrides);
       };
 
       const pauseRoundTimeout = () => {
         roundControl.dispose();
         roundSignal = combineAbortSignals([overrides.signal]);
+        reportProgress(ctx, progress, `round ${round}/${maxRounds}: timeout paused for user direction`, overrides);
       };
 
       try {
-        setStatus(ctx, `round ${round}/${maxRounds}: skeptic`);
+        reportProgress(ctx, progress, `round ${round}/${maxRounds}: skeptic`, overrides);
         const skeptic = await runRole({
           cwd: path.dirname(specPath),
           model: models.skeptic,
@@ -288,7 +302,7 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
           signal: roundSignal,
         });
 
-        setStatus(ctx, `round ${round}/${maxRounds}: builder`);
+        reportProgress(ctx, progress, `round ${round}/${maxRounds}: builder`, overrides);
         let revisedSpec = stripWrappingCodeFence(
           await runRole({
             cwd: path.dirname(specPath),
@@ -301,7 +315,7 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
           }),
         ).trimEnd() + "\n";
 
-        setStatus(ctx, `round ${round}/${maxRounds}: judge`);
+        reportProgress(ctx, progress, `round ${round}/${maxRounds}: judge`, overrides);
         let judge = parseJudgeDecision(
           await runRole({
             cwd: path.dirname(specPath),
@@ -321,7 +335,7 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
           judge = { ...judge, questions };
 
           if (ctx.hasUI) {
-            setStatus(ctx, `round ${round}/${maxRounds}: awaiting user direction`);
+            reportProgress(ctx, progress, `round ${round}/${maxRounds}: awaiting user direction`, overrides);
             pauseRoundTimeout();
             let responses: UserDecisionAnswer[];
             try {
@@ -338,8 +352,9 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
                 pendingQuestions: [],
               };
               await writeUserDecisionRoundFile(outputDir, round, userDecision);
+              reportProgress(ctx, progress, `round ${round}/${maxRounds}: user direction checkpointed`, overrides);
 
-              setStatus(ctx, `round ${round}/${maxRounds}: integrating user direction after timeout reset`);
+              reportProgress(ctx, progress, `round ${round}/${maxRounds}: integrating user direction`, overrides);
               revisedSpec = stripWrappingCodeFence(
                 await runRole({
                   cwd: path.dirname(specPath),
@@ -352,7 +367,7 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
                 }),
               ).trimEnd() + "\n";
 
-              setStatus(ctx, `round ${round}/${maxRounds}: re-judge after user direction`);
+              reportProgress(ctx, progress, `round ${round}/${maxRounds}: re-judge after user direction`, overrides);
               judge = parseJudgeDecision(
                 await runRole({
                   cwd: path.dirname(specPath),
@@ -439,12 +454,32 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
       status,
     };
   } finally {
-    setStatus(ctx, undefined);
+    clearProgress(ctx);
   }
 }
 
-function setStatus(ctx: ExtensionCommandContext | ExtensionContext, text: string | undefined) {
-  if (ctx.hasUI) ctx.ui.setStatus("spec-debate", text);
+function createProgressTracker(): DebateProgressTracker {
+  return { lines: [] };
+}
+
+function reportProgress(
+  ctx: ExtensionCommandContext | ExtensionContext,
+  progress: DebateProgressTracker,
+  text: string,
+  overrides: DebateOverrides,
+) {
+  if (ctx.hasUI) {
+    ctx.ui.setStatus("spec-debate", text);
+    progress.lines.push(`${new Date().toLocaleTimeString()} ${text}`);
+    ctx.ui.setWidget("spec-debate-progress", ["spec-debate progress", ...progress.lines.slice(-10)]);
+  }
+  overrides.onProgress?.(text);
+}
+
+function clearProgress(ctx: ExtensionCommandContext | ExtensionContext) {
+  if (!ctx.hasUI) return;
+  ctx.ui.setStatus("spec-debate", undefined);
+  ctx.ui.setWidget("spec-debate-progress", undefined);
 }
 
 function resolveModels(
