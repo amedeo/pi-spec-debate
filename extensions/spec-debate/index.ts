@@ -262,8 +262,19 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
 
   try {
     for (let round = 1; round <= maxRounds; round++) {
-      const roundControl = createTimeoutAbortControl(config.timeouts.roundMs, `debate round ${round}`);
-      const roundSignal = combineAbortSignals([overrides.signal, roundControl.signal]);
+      let roundControl = createTimeoutAbortControl(config.timeouts.roundMs, `debate round ${round}`);
+      let roundSignal = combineAbortSignals([overrides.signal, roundControl.signal]);
+
+      const resetRoundTimeout = () => {
+        roundControl.dispose();
+        roundControl = createTimeoutAbortControl(config.timeouts.roundMs, `debate round ${round}`);
+        roundSignal = combineAbortSignals([overrides.signal, roundControl.signal]);
+      };
+
+      const pauseRoundTimeout = () => {
+        roundControl.dispose();
+        roundSignal = combineAbortSignals([overrides.signal]);
+      };
 
       try {
         setStatus(ctx, `round ${round}/${maxRounds}: skeptic`);
@@ -311,7 +322,13 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
 
           if (ctx.hasUI) {
             setStatus(ctx, `round ${round}/${maxRounds}: awaiting user direction`);
-            const responses = await collectUserDecisionResponses(ctx, specPath, round, maxRounds, judge);
+            pauseRoundTimeout();
+            let responses: UserDecisionAnswer[];
+            try {
+              responses = await collectUserDecisionResponses(ctx, specPath, round, maxRounds, judge);
+            } finally {
+              resetRoundTimeout();
+            }
 
             if (responses.length > 0) {
               userDecision = {
