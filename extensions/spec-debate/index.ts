@@ -46,6 +46,10 @@ interface DebateOverrides {
 
 interface DebateProgressTracker {
   lines: string[];
+  current: string;
+  spinnerIndex: number;
+  startedAt: number;
+  timer?: ReturnType<typeof setInterval>;
 }
 
 interface DebateRoleExecutionConfig {
@@ -271,6 +275,7 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
   const progress = createProgressTracker();
 
   reportProgress(ctx, progress, `starting ${path.basename(specPath)}`, overrides);
+  startProgressTicker(ctx, progress);
 
   try {
     for (let round = 1; round <= maxRounds; round++) {
@@ -454,12 +459,47 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
       status,
     };
   } finally {
-    clearProgress(ctx);
+    clearProgress(ctx, progress);
   }
 }
 
+const PROGRESS_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 function createProgressTracker(): DebateProgressTracker {
-  return { lines: [] };
+  return {
+    lines: [],
+    current: "starting",
+    spinnerIndex: 0,
+    startedAt: Date.now(),
+  };
+}
+
+function startProgressTicker(ctx: ExtensionCommandContext | ExtensionContext, progress: DebateProgressTracker) {
+  if (!ctx.hasUI || progress.timer) return;
+  progress.timer = setInterval(() => {
+    progress.spinnerIndex = (progress.spinnerIndex + 1) % PROGRESS_SPINNER_FRAMES.length;
+    renderProgress(ctx, progress);
+  }, 250);
+}
+
+function renderProgress(ctx: ExtensionCommandContext | ExtensionContext, progress: DebateProgressTracker) {
+  if (!ctx.hasUI) return;
+  const frame = PROGRESS_SPINNER_FRAMES[progress.spinnerIndex % PROGRESS_SPINNER_FRAMES.length];
+  const elapsed = formatElapsed(Date.now() - progress.startedAt);
+  ctx.ui.setStatus("spec-debate", `${frame} ${progress.current}`);
+  ctx.ui.setWidget("spec-debate-progress", [
+    `${frame} spec-debate running ${elapsed}`,
+    `current: ${progress.current}`,
+    "",
+    ...progress.lines.slice(-10),
+  ]);
+}
+
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
 function reportProgress(
@@ -469,14 +509,18 @@ function reportProgress(
   overrides: DebateOverrides,
 ) {
   if (ctx.hasUI) {
-    ctx.ui.setStatus("spec-debate", text);
+    progress.current = text;
     progress.lines.push(`${new Date().toLocaleTimeString()} ${text}`);
-    ctx.ui.setWidget("spec-debate-progress", ["spec-debate progress", ...progress.lines.slice(-10)]);
+    renderProgress(ctx, progress);
   }
   overrides.onProgress?.(text);
 }
 
-function clearProgress(ctx: ExtensionCommandContext | ExtensionContext) {
+function clearProgress(ctx: ExtensionCommandContext | ExtensionContext, progress: DebateProgressTracker) {
+  if (progress.timer) {
+    clearInterval(progress.timer);
+    progress.timer = undefined;
+  }
   if (!ctx.hasUI) return;
   ctx.ui.setStatus("spec-debate", undefined);
   ctx.ui.setWidget("spec-debate-progress", undefined);
