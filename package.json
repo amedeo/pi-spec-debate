@@ -4,6 +4,7 @@
   "private": false,
   "description": "Multi-model spec debate workflow for Pi",
   "keywords": ["pi-package"],
+  "files": ["extensions", "skills"],
   "pi": {
     "extensions": ["./extensions"],
     "skills": ["./skills"]

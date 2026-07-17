@@ -64,8 +64,11 @@ Typical outputs:
 - `final.md` — latest revised draft
 - `consensus.md` — final decision, next steps, and any pending user questions
 - `debate.md` — full round-by-round log
-- `round-01-*.md/json` — per-round artifacts
+- `round-01-*.md/json` — per-round artifacts, checkpointed as each role completes
 - `round-01-user.md` — user direction requested or provided in that round, when applicable
+- `failure.md` — failure details and the latest partial model output, when a run fails
+
+In Pi's expanded message view, the extension also shows the round-by-round skeptic / judge / builder back-and-forth inline, while still writing the full artifacts to disk.
 
 Example output tree:
 
@@ -83,6 +86,12 @@ idea.spec-debate/
 In interactive TUI/RPC use, the debate can pause mid-run to ask the user for architectural, technical, design, product, or rollout direction, then continue with that answer integrated into the spec. In non-interactive mode, it stops with `needs-user-input` and writes the pending questions to disk.
 
 The original source file is left untouched.
+
+## Live progress and model output
+
+While a debate runs, Pi shows the active round, role, model, elapsed time, provider retries or tool activity, and a bounded live preview of the role's output. The preview is the model's actual response that will be passed to the next role—not hidden chain-of-thought. Raw private reasoning is intentionally not exposed; Pi shows a `model reasoning (content hidden)` activity indicator instead.
+
+Expand the completed command message or `spec_debate` tool result to inspect the full skeptic, judge, user-direction, and builder artifacts for every completed round.
 
 ## Tool usage
 
@@ -110,10 +119,10 @@ Example:
     "judge": "google/gemini-2.5-pro"
   },
   "timeouts": {
-    "skepticMs": 90000,
-    "builderMs": 150000,
-    "judgeMs": 60000,
-    "roundMs": 300000,
+    "skepticMs": 300000,
+    "builderMs": 600000,
+    "judgeMs": 300000,
+    "roundMs": 0,
     "terminateGraceMs": 3000
   },
   "childTools": {
@@ -139,6 +148,8 @@ Environment variables also work:
 - `PI_SPEC_DEBATE_WEB_SEARCH_TOOLS`
 - `PI_SPEC_DEBATE_WEB_SEARCH_ROLES`
 
+A timeout value of `0` disables that timeout. The per-round timeout is disabled by default so it cannot race the individual role budgets; cancellation from Pi still stops the active child process. Set a finite `roundMs` if you need an overall wall-clock cap.
+
 By default, child skeptic/judge runs will use `web_search` if that tool is installed and available in Pi. Builder stays tool-free by default.
 
 Per-command arguments override config.
@@ -146,11 +157,19 @@ Per-command arguments override config.
 ## Notes
 
 - Child debate agents remain isolated by default. When `web_search` is available, skeptic/judge child runs allowlist only that tool and exclude `spec_debate` to avoid recursion.
-- Child subprocesses support per-role timeouts, a per-round timeout, and SIGTERM→SIGKILL escalation on cancellation.
+- Child subprocesses support optional per-role and per-round timeouts plus SIGTERM→SIGKILL escalation on cancellation.
 - This package is designed to work the same way on Linux and macOS.
 - The child `pi` executable must be available on your `PATH`.
 
 ## Release history
+
+### Unreleased
+
+- live role status, activity, elapsed time, and bounded output previews
+- expanded round transcripts for command and tool results
+- partial role checkpoints and failure reports
+- safer timeout defaults, optional disabled timeouts, and a disabled-by-default round cap
+- reduced judge and user-direction prompt duplication
 
 ### v0.1.0
 

@@ -35,20 +35,42 @@ interface DebateConfig {
   childTools: DebateChildToolConfig;
 }
 
+interface DebateConfigOverride {
+  maxRounds?: number;
+  writeRoundFiles?: boolean;
+  models?: Partial<Record<RoleName, string>>;
+  timeouts?: Partial<DebateTimeoutConfig>;
+  childTools?: Partial<DebateChildToolConfig>;
+}
+
+interface DebateProgressUpdate {
+  current: string;
+  elapsedMs: number;
+  history: string[];
+  activity?: string;
+  outputLabel?: string;
+  outputPreview?: string;
+}
+
 interface DebateOverrides {
   rounds?: number;
   outputDir?: string;
   models?: Partial<Record<RoleName, string>>;
   availableToolNames?: string[];
   signal?: AbortSignal;
-  onProgress?: (message: string) => void;
+  onProgress?: (update: DebateProgressUpdate) => void;
 }
 
 interface DebateProgressTracker {
   lines: string[];
   current: string;
+  activity?: string;
+  outputLabel?: string;
+  outputPreview: string;
   spinnerIndex: number;
   startedAt: number;
+  lastRenderedAt: number;
+  lastPublishedAt: number;
   timer?: ReturnType<typeof setInterval>;
 }
 
@@ -58,6 +80,11 @@ interface DebateRoleExecutionConfig {
   webSearchToolName?: string;
   approveProject: boolean;
   signal?: AbortSignal;
+}
+
+interface TimeoutAbortControl {
+  signal?: AbortSignal;
+  dispose(): void;
 }
 
 interface UserDecisionQuestion {
@@ -112,10 +139,10 @@ const DEFAULT_CONFIG: DebateConfig = {
   writeRoundFiles: true,
   models: {},
   timeouts: {
-    skepticMs: 90_000,
-    builderMs: 150_000,
-    judgeMs: 60_000,
-    roundMs: 300_000,
+    skepticMs: 300_000,
+    builderMs: 600_000,
+    judgeMs: 300_000,
+    roundMs: 0,
     terminateGraceMs: 3_000,
   },
   childTools: {
@@ -140,11 +167,9 @@ export default function (pi: ExtensionAPI) {
     text += "\n" + message.content;
 
     if (options.expanded && message.details) {
-      const details = message.details as Partial<DebateRunResult>;
-      const rounds = details.rounds?.length ?? 0;
-      if (details.outputDir) text += `\n\nOutput: ${details.outputDir}`;
-      if (details.status) text += `\nStatus: ${details.status}`;
-      text += `\nRounds: ${rounds}`;
+      const details = message.details as Partial<DebateRunResult> & { error?: string };
+      const extra = buildExpandedMessageDetails(details);
+      if (extra) text += `\n\n${extra}`;
     }
 
     return new Text(text, 0, 0);
@@ -216,35 +241,49 @@ export default function (pi: ExtensionAPI) {
         },
         availableToolNames: pi.getAllTools().map((tool) => tool.name),
         signal,
-        onProgress: (message) => {
+        onProgress: (update) => {
           onUpdate?.({
-            content: [{ type: "text", text: message }],
-            details: { status: "running", current: message },
+            content: [{ type: "text", text: buildProgressUpdateText(update) }],
+            details: { status: "running", ...update },
           });
         },
       });
 
       return {
         content: [{ type: "text", text: buildSummary(result) }],
-        details: {
-          sourcePath: result.sourcePath,
-          outputDir: result.outputDir,
-          finalSpecPath: result.finalSpecPath,
-          consensusPath: result.consensusPath,
-          debatePath: result.debatePath,
-          status: result.status,
-          rounds: result.rounds.map((round) => ({
-            round: round.round,
-            consensus: round.judge.consensus,
-            confidence: round.judge.confidence,
-            summary: round.judge.summary,
-            mustFixCount: round.judge.mustFix.length,
-            needsUserInput: round.judge.needsUserInput,
-            userQuestionCount: round.judge.questions.length,
-          })),
-          models: result.models,
-        },
+        details: result,
       };
+    },
+    renderCall(args, theme) {
+      let text = theme.fg("toolTitle", theme.bold("spec_debate "));
+      text += theme.fg("muted", args.path);
+      if (args.rounds) text += theme.fg("dim", ` · up to ${args.rounds} rounds`);
+      return new Text(text, 0, 0);
+    },
+    renderResult(result, { expanded, isPartial }, theme) {
+      const content = toolResultText(result.content);
+
+      if (isPartial) {
+        const update = result.details as (Partial<DebateProgressUpdate> & { status?: string }) | undefined;
+        let text = theme.fg("warning", update?.current ?? "spec-debate running");
+        if (typeof update?.elapsedMs === "number") {
+          text += theme.fg("dim", ` · ${formatElapsed(update.elapsedMs)}`);
+        }
+        if (update?.activity) text += `\n${theme.fg("dim", update.activity)}`;
+        if (update?.outputPreview?.trim()) {
+          text += `\n\n${theme.fg("muted", `${update.outputLabel ?? "Model"} output (live):`)}`;
+          text += `\n${update.outputPreview.trimEnd()}`;
+        }
+        return new Text(text, 0, 0);
+      }
+
+      const details = result.details as Partial<DebateRunResult> | undefined;
+      let text = content;
+      if (expanded && details) {
+        const extra = buildExpandedMessageDetails(details);
+        if (extra) text += `\n\n${extra}`;
+      }
+      return new Text(text, 0, 0);
     },
   });
 }
@@ -268,14 +307,21 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
     : defaultOutputDirFor(specPath);
 
   await mkdir(outputDir, { recursive: true });
+  await rm(path.join(outputDir, "failure.md"), { force: true });
 
   let currentSpec = sourceText.trimEnd() + "\n";
   const rounds: DebateRound[] = [];
   let status: DebateStatus = "max-rounds";
   const progress = createProgressTracker();
 
-  reportProgress(ctx, progress, `starting ${path.basename(specPath)}`, overrides);
-  startProgressTicker(ctx, progress);
+  const timeoutSummary = [
+    `skeptic ${formatTimeout(config.timeouts.skepticMs)}`,
+    `builder ${formatTimeout(config.timeouts.builderMs)}`,
+    `judge ${formatTimeout(config.timeouts.judgeMs)}`,
+    `round ${formatTimeout(config.timeouts.roundMs)}`,
+  ].join(" · ");
+  reportProgress(ctx, progress, `starting ${path.basename(specPath)} · ${timeoutSummary}`, overrides);
+  startProgressTicker(ctx, progress, overrides);
 
   try {
     for (let round = 1; round <= maxRounds; round++) {
@@ -296,7 +342,13 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
       };
 
       try {
-        reportProgress(ctx, progress, `round ${round}/${maxRounds}: skeptic`, overrides);
+        beginRoleProgress(
+          ctx,
+          progress,
+          `round ${round}/${maxRounds}: skeptic · ${models.skeptic ?? "default model"}`,
+          "Skeptic",
+          overrides,
+        );
         const skeptic = await runRole({
           cwd: path.dirname(specPath),
           model: models.skeptic,
@@ -305,9 +357,19 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
           label: `skeptic round ${round}`,
           ...roleExecution.skeptic,
           signal: roundSignal,
+          onTextDelta: (delta) => reportRoleOutput(ctx, progress, delta, overrides),
+          onActivity: (activity) => reportRoleActivity(ctx, progress, activity, overrides),
         });
+        if (config.writeRoundFiles) await writeSkepticRoundFile(outputDir, round, skeptic);
+        reportProgress(ctx, progress, `round ${round}/${maxRounds}: skeptic complete`, overrides);
 
-        reportProgress(ctx, progress, `round ${round}/${maxRounds}: builder`, overrides);
+        beginRoleProgress(
+          ctx,
+          progress,
+          `round ${round}/${maxRounds}: builder · ${models.builder ?? "default model"}`,
+          "Builder",
+          overrides,
+        );
         let revisedSpec = stripWrappingCodeFence(
           await runRole({
             cwd: path.dirname(specPath),
@@ -317,21 +379,34 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
             label: `builder round ${round}`,
             ...roleExecution.builder,
             signal: roundSignal,
+            onTextDelta: (delta) => reportRoleOutput(ctx, progress, delta, overrides),
+            onActivity: (activity) => reportRoleActivity(ctx, progress, activity, overrides),
           }),
         ).trimEnd() + "\n";
+        if (config.writeRoundFiles) await writeBuilderRoundFile(outputDir, round, revisedSpec);
+        reportProgress(ctx, progress, `round ${round}/${maxRounds}: builder complete`, overrides);
 
-        reportProgress(ctx, progress, `round ${round}/${maxRounds}: judge`, overrides);
-        let judge = parseJudgeDecision(
-          await runRole({
-            cwd: path.dirname(specPath),
-            model: models.judge,
-            systemPrompt: judgeSystemPrompt(),
-            prompt: buildJudgePrompt(currentSpec, skeptic, revisedSpec, rounds, round, maxRounds),
-            label: `judge round ${round}`,
-            ...roleExecution.judge,
-            signal: roundSignal,
-          }),
+        beginRoleProgress(
+          ctx,
+          progress,
+          `round ${round}/${maxRounds}: judge · ${models.judge ?? "default model"}`,
+          "Judge",
+          overrides,
         );
+        const judgeRaw = await runRole({
+          cwd: path.dirname(specPath),
+          model: models.judge,
+          systemPrompt: judgeSystemPrompt(),
+          prompt: buildJudgePrompt(skeptic, revisedSpec, rounds, round, maxRounds),
+          label: `judge round ${round}`,
+          ...roleExecution.judge,
+          signal: roundSignal,
+          onTextDelta: (delta) => reportRoleOutput(ctx, progress, delta, overrides),
+          onActivity: (activity) => reportRoleActivity(ctx, progress, activity, overrides),
+        });
+        let judge = parseJudgeDecision(judgeRaw);
+        if (config.writeRoundFiles) await writeJudgeRoundFile(outputDir, round, judge);
+        reportProgress(ctx, progress, `round ${round}/${maxRounds}: judge complete`, overrides);
 
         let userDecision: UserDecisionState | undefined;
 
@@ -359,31 +434,50 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
               await writeUserDecisionRoundFile(outputDir, round, userDecision);
               reportProgress(ctx, progress, `round ${round}/${maxRounds}: user direction checkpointed`, overrides);
 
-              reportProgress(ctx, progress, `round ${round}/${maxRounds}: integrating user direction`, overrides);
+              beginRoleProgress(
+                ctx,
+                progress,
+                `round ${round}/${maxRounds}: integrating user direction · ${models.builder ?? "default model"}`,
+                "Builder",
+                overrides,
+              );
               revisedSpec = stripWrappingCodeFence(
                 await runRole({
                   cwd: path.dirname(specPath),
                   model: models.builder,
                   systemPrompt: builderSystemPrompt(),
-                  prompt: buildUserDecisionIntegrationPrompt(currentSpec, skeptic, revisedSpec, judge, responses, rounds, round, maxRounds),
+                  prompt: buildUserDecisionIntegrationPrompt(skeptic, revisedSpec, judge, responses, rounds, round, maxRounds),
                   label: `builder user-direction round ${round}`,
                   ...roleExecution.builder,
                   signal: roundSignal,
+                  onTextDelta: (delta) => reportRoleOutput(ctx, progress, delta, overrides),
+                  onActivity: (activity) => reportRoleActivity(ctx, progress, activity, overrides),
                 }),
               ).trimEnd() + "\n";
+              if (config.writeRoundFiles) await writeBuilderRoundFile(outputDir, round, revisedSpec);
+              reportProgress(ctx, progress, `round ${round}/${maxRounds}: user direction integrated`, overrides);
 
-              reportProgress(ctx, progress, `round ${round}/${maxRounds}: re-judge after user direction`, overrides);
-              judge = parseJudgeDecision(
-                await runRole({
-                  cwd: path.dirname(specPath),
-                  model: models.judge,
-                  systemPrompt: judgeSystemPrompt(),
-                  prompt: buildJudgePrompt(currentSpec, skeptic, revisedSpec, rounds, round, maxRounds),
-                  label: `judge after user direction round ${round}`,
-                  ...roleExecution.judge,
-                  signal: roundSignal,
-                }),
+              beginRoleProgress(
+                ctx,
+                progress,
+                `round ${round}/${maxRounds}: re-judge · ${models.judge ?? "default model"}`,
+                "Judge",
+                overrides,
               );
+              const rejudgeRaw = await runRole({
+                cwd: path.dirname(specPath),
+                model: models.judge,
+                systemPrompt: judgeSystemPrompt(),
+                prompt: buildJudgePrompt(skeptic, revisedSpec, rounds, round, maxRounds),
+                label: `judge after user direction round ${round}`,
+                ...roleExecution.judge,
+                signal: roundSignal,
+                onTextDelta: (delta) => reportRoleOutput(ctx, progress, delta, overrides),
+                onActivity: (activity) => reportRoleActivity(ctx, progress, activity, overrides),
+              });
+              judge = parseJudgeDecision(rejudgeRaw);
+              if (config.writeRoundFiles) await writeJudgeRoundFile(outputDir, round, judge);
+              reportProgress(ctx, progress, `round ${round}/${maxRounds}: re-judge complete`, overrides);
 
               if (judge.needsUserInput && judge.questions.length === 0) {
                 judge = { ...judge, questions: fallbackUserDecisionQuestions(judge) };
@@ -440,6 +534,7 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
       }
     }
 
+    reportProgress(ctx, progress, "finalizing debate artifacts", overrides);
     const finalSpecPath = path.join(outputDir, "final.md");
     const consensusPath = path.join(outputDir, "consensus.md");
     const debatePath = path.join(outputDir, "debate.md");
@@ -458,27 +553,43 @@ async function runDebate(specPathArg: string, ctx: ExtensionCommandContext | Ext
       models,
       status,
     };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    reportProgress(ctx, progress, `failed: ${message}`, overrides);
+    await writeFailureReport(outputDir, specPath, message, progress).catch(() => undefined);
+    throw error;
   } finally {
     clearProgress(ctx, progress);
   }
 }
 
 const PROGRESS_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const PROGRESS_PREVIEW_MAX_CHARS = 12_000;
+const PROGRESS_PUBLISH_INTERVAL_MS = 500;
 
 function createProgressTracker(): DebateProgressTracker {
+  const now = Date.now();
   return {
     lines: [],
     current: "starting",
+    outputPreview: "",
     spinnerIndex: 0,
-    startedAt: Date.now(),
+    startedAt: now,
+    lastRenderedAt: 0,
+    lastPublishedAt: 0,
   };
 }
 
-function startProgressTicker(ctx: ExtensionCommandContext | ExtensionContext, progress: DebateProgressTracker) {
-  if (!ctx.hasUI || progress.timer) return;
+function startProgressTicker(
+  ctx: ExtensionCommandContext | ExtensionContext,
+  progress: DebateProgressTracker,
+  overrides: DebateOverrides,
+) {
+  if ((!ctx.hasUI && !overrides.onProgress) || progress.timer) return;
   progress.timer = setInterval(() => {
     progress.spinnerIndex = (progress.spinnerIndex + 1) % PROGRESS_SPINNER_FRAMES.length;
     renderProgress(ctx, progress);
+    publishProgress(progress, overrides);
   }, 250);
 }
 
@@ -487,12 +598,29 @@ function renderProgress(ctx: ExtensionCommandContext | ExtensionContext, progres
   const frame = PROGRESS_SPINNER_FRAMES[progress.spinnerIndex % PROGRESS_SPINNER_FRAMES.length];
   const elapsed = formatElapsed(Date.now() - progress.startedAt);
   ctx.ui.setStatus("spec-debate", `${frame} ${progress.current}`);
-  ctx.ui.setWidget("spec-debate-progress", [
+  const widgetText = buildProgressWidgetText(progress, frame, elapsed);
+  if (ctx.mode === "tui") {
+    ctx.ui.setWidget("spec-debate-progress", () => new Text(widgetText, 0, 0));
+  } else {
+    ctx.ui.setWidget("spec-debate-progress", widgetText.split("\n"));
+  }
+  progress.lastRenderedAt = Date.now();
+}
+
+function buildProgressWidgetText(progress: DebateProgressTracker, frame: string, elapsed: string): string {
+  return [
     `${frame} spec-debate running ${elapsed}`,
     `current: ${progress.current}`,
+    progress.activity ? `activity: ${progress.activity}` : "",
     "",
-    ...progress.lines.slice(-10),
-  ]);
+    ...progress.lines.slice(-5),
+    "",
+    progress.outputPreview.trim() ? `${progress.outputLabel ?? "Model"} output (live):` : "",
+    progress.outputPreview.trim() ? tailText(progress.outputPreview, 2_400, 10) : "",
+  ]
+    .filter((line, index, lines) => line || (index > 0 && lines[index - 1]))
+    .join("\n")
+    .trimEnd();
 }
 
 function formatElapsed(ms: number): string {
@@ -502,18 +630,98 @@ function formatElapsed(ms: number): string {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
 }
 
+function formatTimeout(ms: number): string {
+  return ms === 0 ? "off" : formatDuration(ms);
+}
+
 function reportProgress(
   ctx: ExtensionCommandContext | ExtensionContext,
   progress: DebateProgressTracker,
   text: string,
   overrides: DebateOverrides,
 ) {
-  if (ctx.hasUI) {
-    progress.current = text;
-    progress.lines.push(`${new Date().toLocaleTimeString()} ${text}`);
-    renderProgress(ctx, progress);
-  }
-  overrides.onProgress?.(text);
+  progress.current = text;
+  progress.activity = undefined;
+  progress.lines.push(`${new Date().toLocaleTimeString()} ${text}`);
+  renderProgress(ctx, progress);
+  publishProgress(progress, overrides, true);
+}
+
+function beginRoleProgress(
+  ctx: ExtensionCommandContext | ExtensionContext,
+  progress: DebateProgressTracker,
+  text: string,
+  outputLabel: string,
+  overrides: DebateOverrides,
+) {
+  progress.outputLabel = outputLabel;
+  progress.outputPreview = "";
+  reportProgress(ctx, progress, text, overrides);
+  progress.activity = "waiting for model";
+  renderProgress(ctx, progress);
+  publishProgress(progress, overrides, true);
+}
+
+function reportRoleOutput(
+  ctx: ExtensionCommandContext | ExtensionContext,
+  progress: DebateProgressTracker,
+  delta: string,
+  overrides: DebateOverrides,
+) {
+  progress.outputPreview = (progress.outputPreview + delta).slice(-PROGRESS_PREVIEW_MAX_CHARS);
+  progress.activity = "streaming final output";
+  const now = Date.now();
+  if (now - progress.lastRenderedAt >= 100) renderProgress(ctx, progress);
+  publishProgress(progress, overrides);
+}
+
+function reportRoleActivity(
+  ctx: ExtensionCommandContext | ExtensionContext,
+  progress: DebateProgressTracker,
+  activity: string,
+  overrides: DebateOverrides,
+) {
+  if (progress.activity === activity) return;
+  progress.activity = activity;
+  renderProgress(ctx, progress);
+  publishProgress(progress, overrides, true);
+}
+
+function publishProgress(progress: DebateProgressTracker, overrides: DebateOverrides, force = false) {
+  if (!overrides.onProgress) return;
+  const now = Date.now();
+  if (!force && now - progress.lastPublishedAt < PROGRESS_PUBLISH_INTERVAL_MS) return;
+  progress.lastPublishedAt = now;
+  overrides.onProgress({
+    current: progress.current,
+    elapsedMs: now - progress.startedAt,
+    history: progress.lines.slice(-8),
+    activity: progress.activity,
+    outputLabel: progress.outputLabel,
+    outputPreview: progress.outputPreview.trim() ? tailText(progress.outputPreview, 4_000, 20) : undefined,
+  });
+}
+
+function buildProgressUpdateText(update: DebateProgressUpdate): string {
+  return [
+    `spec-debate running ${formatElapsed(update.elapsedMs)}`,
+    `current: ${update.current}`,
+    update.activity ? `activity: ${update.activity}` : "",
+    update.outputPreview?.trim() ? "" : "",
+    update.outputPreview?.trim() ? `${update.outputLabel ?? "Model"} output (live):` : "",
+    update.outputPreview?.trim() ? update.outputPreview.trimEnd() : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function tailText(text: string, maxChars: number, maxLines: number): string {
+  const wasCharClipped = text.length > maxChars;
+  const clipped = wasCharClipped ? text.slice(-maxChars) : text;
+  const lines = clipped.split(/\r?\n/);
+  const wasLineClipped = lines.length > maxLines;
+  const tail = lines.slice(-maxLines).join("\n");
+  return wasCharClipped || wasLineClipped ? `…\n${tail}` : tail;
 }
 
 function clearProgress(ctx: ExtensionCommandContext | ExtensionContext, progress: DebateProgressTracker) {
@@ -550,7 +758,7 @@ async function loadConfig(ctx: ExtensionCommandContext | ExtensionContext): Prom
   return mergeConfig(config, envConfig());
 }
 
-function envConfig(): Partial<DebateConfig> {
+function envConfig(): DebateConfigOverride {
   const models: Partial<Record<RoleName, string>> = {};
   if (process.env.PI_SPEC_DEBATE_SKEPTIC_MODEL) models.skeptic = process.env.PI_SPEC_DEBATE_SKEPTIC_MODEL;
   if (process.env.PI_SPEC_DEBATE_BUILDER_MODEL) models.builder = process.env.PI_SPEC_DEBATE_BUILDER_MODEL;
@@ -572,18 +780,18 @@ function envConfig(): Partial<DebateConfig> {
       enableWebSearch: parseOptionalBoolean(process.env.PI_SPEC_DEBATE_ENABLE_WEB_SEARCH),
       webSearchToolNames: parseOptionalList(process.env.PI_SPEC_DEBATE_WEB_SEARCH_TOOLS),
       webSearchRoles: parseOptionalRoleList(process.env.PI_SPEC_DEBATE_WEB_SEARCH_ROLES),
-    } as Partial<DebateChildToolConfig>,
+    },
   };
 }
 
-async function readConfigFile(filePath: string): Promise<Partial<DebateConfig> | undefined> {
+async function readConfigFile(filePath: string): Promise<DebateConfigOverride | undefined> {
   if (!fs.existsSync(filePath)) return undefined;
   const raw = await readFile(filePath, "utf8");
-  const parsed = JSON.parse(raw) as Partial<DebateConfig>;
+  const parsed = JSON.parse(raw) as DebateConfigOverride;
   return parsed;
 }
 
-function mergeConfig(base: DebateConfig, override: Partial<DebateConfig> | undefined): DebateConfig {
+function mergeConfig(base: DebateConfig, override: DebateConfigOverride | undefined): DebateConfig {
   if (!override) {
     return {
       ...base,
@@ -666,8 +874,8 @@ function isRoleName(value: string): value is RoleName {
 function validateTimeoutConfig(timeouts: DebateTimeoutConfig) {
   const entries = Object.entries(timeouts) as Array<[keyof DebateTimeoutConfig, number]>;
   for (const [name, value] of entries) {
-    if (!Number.isFinite(value) || value < 1) {
-      throw new Error(`Invalid timeout value for ${name}: ${value}`);
+    if (!Number.isFinite(value) || value < 0) {
+      throw new Error(`Invalid timeout value for ${name}: ${value}. Use 0 to disable a timeout.`);
     }
   }
 }
@@ -700,10 +908,16 @@ function resolveRoleExecutionConfig(
   };
 }
 
-function createTimeoutAbortControl(timeoutMs: number, label: string) {
+function createTimeoutAbortControl(timeoutMs: number, label: string): TimeoutAbortControl {
+  if (timeoutMs === 0) {
+    return { signal: undefined, dispose() {} };
+  }
+
   const controller = new AbortController();
   const timer = setTimeout(() => {
-    controller.abort(new Error(`${label} timed out after ${formatDuration(timeoutMs)}`));
+    controller.abort(
+      new Error(`${label} timed out after ${formatDuration(timeoutMs)}. Increase this timeout or set it to 0 to disable it.`),
+    );
   }, timeoutMs);
 
   return {
@@ -718,32 +932,13 @@ function combineAbortSignals(signals: Array<AbortSignal | undefined>): AbortSign
   const active = signals.filter((signal): signal is AbortSignal => Boolean(signal));
   if (active.length === 0) return undefined;
   if (active.length === 1) return active[0];
-
-  const controller = new AbortController();
-  const onAbort = (event: Event) => {
-    const signal = event.target as AbortSignal;
-    controller.abort(signal.reason ?? new Error("Operation cancelled"));
-    cleanup();
-  };
-  const cleanup = () => {
-    for (const signal of active) {
-      signal.removeEventListener("abort", onAbort);
-    }
-  };
-
-  for (const signal of active) {
-    if (signal.aborted) {
-      controller.abort(signal.reason ?? new Error("Operation cancelled"));
-      return controller.signal;
-    }
-    signal.addEventListener("abort", onAbort, { once: true });
-  }
-
-  return controller.signal;
+  return AbortSignal.any(active);
 }
 
 function formatDuration(ms: number): string {
-  if (ms % 1000 === 0) return `${ms / 1000}s`;
+  if (ms % 3_600_000 === 0) return `${ms / 3_600_000}h`;
+  if (ms % 60_000 === 0) return `${ms / 60_000}m`;
+  if (ms % 1_000 === 0) return `${ms / 1_000}s`;
   return `${ms}ms`;
 }
 
@@ -763,12 +958,14 @@ async function runRole(input: {
   webSearchToolName?: string;
   approveProject: boolean;
   signal?: AbortSignal;
+  onTextDelta?: (delta: string) => void;
+  onActivity?: (activity: string) => void;
 }): Promise<string> {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "pi-spec-debate-"));
   const promptPath = path.join(tempDir, "prompt.md");
   await writeFile(promptPath, input.prompt, "utf8");
 
-  const args = ["-p", "--no-session"];
+  const args = ["--mode", "json", "--no-session"];
 
   if (input.webSearchToolName) {
     args.push(
@@ -795,10 +992,13 @@ async function runRole(input: {
   const signal = combineAbortSignals([input.signal, timeoutControl.signal]);
 
   try {
+    input.onActivity?.("starting child agent");
     const output = await runPi(args, input.cwd, {
       signal,
       terminateGraceMs: input.terminateGraceMs,
       label: input.label,
+      onTextDelta: input.onTextDelta,
+      onActivity: input.onActivity,
     });
     if (!output.trim()) {
       throw new Error(`Empty response from ${input.label}`);
@@ -810,8 +1010,23 @@ async function runRole(input: {
   }
 }
 
-function runPi(args: string[], cwd: string, options: { signal?: AbortSignal; terminateGraceMs: number; label: string }): Promise<string> {
+function runPi(
+  args: string[],
+  cwd: string,
+  options: {
+    signal?: AbortSignal;
+    terminateGraceMs: number;
+    label: string;
+    onTextDelta?: (delta: string) => void;
+    onActivity?: (activity: string) => void;
+  },
+): Promise<string> {
   return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) {
+      reject(new Error(abortMessage(options.signal.reason, `${options.label} cancelled`)));
+      return;
+    }
+
     const proc = spawn("pi", args, {
       cwd,
       shell: false,
@@ -823,75 +1038,178 @@ function runPi(args: string[], cwd: string, options: { signal?: AbortSignal; ter
       stdio: ["ignore", "pipe", "pipe"],
     });
 
-    let stdout = "";
+    let lineBuffer = "";
     let stderr = "";
+    let protocolDiagnostics = "";
+    let currentAssistantText = "";
+    let lastAssistantText = "";
+    let agentError: string | undefined;
+    let abortError: Error | undefined;
     let settled = false;
     let forcedKillTimer: NodeJS.Timeout | undefined;
 
-    const settle = (handler: () => void, preserveKillTimer = false) => {
+    const settle = (handler: () => void) => {
       if (settled) return;
       settled = true;
       options.signal?.removeEventListener("abort", onAbort);
-      if (forcedKillTimer && !preserveKillTimer) clearTimeout(forcedKillTimer);
+      if (forcedKillTimer) clearTimeout(forcedKillTimer);
       handler();
     };
 
     const isRunning = () => proc.exitCode === null && proc.signalCode === null;
 
     const onAbort = () => {
-      const message = abortMessage(options.signal?.reason, `${options.label} cancelled`);
-
-      if (isRunning()) {
-        proc.kill("SIGTERM");
-        forcedKillTimer = setTimeout(() => {
-          if (isRunning()) proc.kill("SIGKILL");
-        }, options.terminateGraceMs);
+      abortError = new Error(abortMessage(options.signal?.reason, `${options.label} cancelled`));
+      options.onActivity?.("cancelling child agent");
+      if (!isRunning()) {
+        settle(() => reject(abortError!));
+        return;
       }
 
-      settle(() => {
-        reject(new Error(message));
-      }, true);
+      proc.kill("SIGTERM");
+      forcedKillTimer = setTimeout(() => {
+        if (isRunning()) proc.kill("SIGKILL");
+      }, options.terminateGraceMs);
     };
 
-    if (options.signal?.aborted) {
-      onAbort();
-      return;
-    }
+    const processJsonLine = (line: string) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+
+      let event: Record<string, unknown>;
+      try {
+        event = JSON.parse(trimmed) as Record<string, unknown>;
+      } catch {
+        protocolDiagnostics = appendTail(protocolDiagnostics, trimmed + "\n", 50_000);
+        return;
+      }
+
+      const type = typeof event.type === "string" ? event.type : "";
+      if (type === "message_start") {
+        const message = asRecord(event.message);
+        if (message?.role === "assistant") {
+          currentAssistantText = "";
+          options.onActivity?.("model responding");
+        }
+        return;
+      }
+
+      if (type === "message_update") {
+        const update = asRecord(event.assistantMessageEvent);
+        const updateType = typeof update?.type === "string" ? update.type : "";
+        if (updateType === "thinking_start" || updateType === "thinking_delta") {
+          // Deliberately expose reasoning activity, not private chain-of-thought content.
+          options.onActivity?.("model reasoning (content hidden)");
+        } else if (updateType === "text_delta" && typeof update?.delta === "string") {
+          currentAssistantText += update.delta;
+          options.onTextDelta?.(update.delta);
+        }
+        return;
+      }
+
+      if (type === "message_end") {
+        const message = asRecord(event.message);
+        if (message?.role !== "assistant") return;
+        const text = assistantText(message) || currentAssistantText;
+        if (text.trim()) {
+          if (!currentAssistantText && options.onTextDelta) options.onTextDelta(text);
+          lastAssistantText = text;
+        }
+        if (message.stopReason === "error" || message.stopReason === "aborted") {
+          agentError = typeof message.errorMessage === "string"
+            ? message.errorMessage
+            : `${options.label} ${message.stopReason}`;
+        }
+        return;
+      }
+
+      if (type === "tool_execution_start") {
+        const toolName = typeof event.toolName === "string" ? event.toolName : "tool";
+        options.onActivity?.(`using ${toolName}`);
+        return;
+      }
+
+      if (type === "auto_retry_start") {
+        const attempt = typeof event.attempt === "number" ? event.attempt : "?";
+        const maxAttempts = typeof event.maxAttempts === "number" ? event.maxAttempts : "?";
+        options.onActivity?.(`provider retry ${attempt}/${maxAttempts}`);
+      }
+    };
 
     options.signal?.addEventListener("abort", onAbort, { once: true });
 
+    proc.on("spawn", () => options.onActivity?.("waiting for model"));
+
     proc.stdout.on("data", (chunk) => {
-      stdout += chunk.toString();
+      lineBuffer += chunk.toString();
+      let newline = lineBuffer.indexOf("\n");
+      while (newline >= 0) {
+        processJsonLine(lineBuffer.slice(0, newline));
+        lineBuffer = lineBuffer.slice(newline + 1);
+        newline = lineBuffer.indexOf("\n");
+      }
     });
 
     proc.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
+      stderr = appendTail(stderr, chunk.toString(), 50_000);
     });
 
     proc.on("error", (error) => {
-      if (settled) return;
       settle(() => {
         reject(new Error(`Failed to start pi subprocess: ${error.message}`));
       });
     });
 
     proc.on("close", (code) => {
-      if (settled) {
-        if (forcedKillTimer) clearTimeout(forcedKillTimer);
-        return;
-      }
+      if (lineBuffer.trim()) processJsonLine(lineBuffer);
 
       settle(() => {
-        if (code === 0) {
-          resolve(stdout);
+        if (abortError) {
+          reject(abortError);
           return;
         }
 
-        const detail = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n\n");
+        if (code === 0 && !agentError) {
+          resolve(lastAssistantText || currentAssistantText);
+          return;
+        }
+
+        const detail = [agentError, stderr.trim(), protocolDiagnostics.trim()].filter(Boolean).join("\n\n");
         reject(new Error(`pi subprocess failed (${code}). ${detail || "No output."}`));
       });
     });
   });
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" ? value as Record<string, unknown> : undefined;
+}
+
+function assistantText(message: Record<string, unknown>): string {
+  if (typeof message.content === "string") return message.content;
+  if (!Array.isArray(message.content)) return "";
+  return message.content
+    .map((item) => {
+      const block = asRecord(item);
+      return block?.type === "text" && typeof block.text === "string" ? block.text : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function appendTail(current: string, addition: string, maxChars: number): string {
+  return (current + addition).slice(-maxChars);
+}
+
+function toolResultText(content: unknown): string {
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((item) => {
+      const block = asRecord(item);
+      return block?.type === "text" && typeof block.text === "string" ? block.text : "";
+    })
+    .filter(Boolean)
+    .join("\n");
 }
 
 function parseJudgeDecision(raw: string): JudgeDecision {
@@ -978,6 +1296,7 @@ function skepticSystemPrompt(): string {
     "You are the skeptic in a spec review loop.",
     "Be critical but constructive.",
     "Find hidden assumptions, feasibility gaps, unclear scope, rollout risks, missing decisions, and contradictions.",
+    "Keep the critique focused and concise; prioritize issues that can materially change implementation or approval.",
     "Return markdown with the exact headings: ## Blocking Issues, ## Major Risks, ## Ambiguities, ## Questions, ## Suggested Revisions.",
   ].join(" ");
 }
@@ -1041,7 +1360,6 @@ function buildBuilderPrompt(
 }
 
 function buildUserDecisionIntegrationPrompt(
-  previousSpec: string,
   skeptic: string,
   revisedSpec: string,
   judge: JudgeDecision,
@@ -1056,8 +1374,6 @@ function buildUserDecisionIntegrationPrompt(
     "Make the chosen direction explicit in scope, assumptions, architecture, design, rollout, or tradeoff sections where relevant.",
     "Preserve the intent of the document and resolve the decision without adding commentary outside the spec.",
     previousRounds.length > 0 ? `Prior judge summaries:\n${judgeSummaryBlock(previousRounds)}` : "",
-    "# Previous spec",
-    previousSpec,
     "# Skeptic critique",
     skeptic,
     "# Current revised spec",
@@ -1072,7 +1388,6 @@ function buildUserDecisionIntegrationPrompt(
 }
 
 function buildJudgePrompt(
-  previousSpec: string,
   skeptic: string,
   revisedSpec: string,
   previousRounds: DebateRound[],
@@ -1085,8 +1400,6 @@ function buildJudgePrompt(
     "Consensus means the document is coherent, actionable, and missing only minor refinements.",
     "If the draft now depends on a human owner choosing between materially different valid directions, set needsUserInput=true.",
     previousRounds.length > 0 ? `Prior judge summaries:\n${judgeSummaryBlock(previousRounds)}` : "",
-    "# Previous spec",
-    previousSpec,
     "# Skeptic critique",
     skeptic,
     "# Revised spec",
@@ -1145,14 +1458,55 @@ async function collectUserDecisionResponses(
 }
 
 async function writeRoundFiles(outputDir: string, round: DebateRound) {
-  const prefix = `round-${String(round.round).padStart(2, "0")}`;
-  await writeFile(path.join(outputDir, `${prefix}-skeptic.md`), round.skeptic + "\n", "utf8");
-  await writeFile(path.join(outputDir, `${prefix}-builder.md`), round.revisedSpec, "utf8");
-  await writeFile(path.join(outputDir, `${prefix}-judge.json`), JSON.stringify(round.judge, null, 2) + "\n", "utf8");
+  await writeSkepticRoundFile(outputDir, round.round, round.skeptic);
+  await writeBuilderRoundFile(outputDir, round.round, round.revisedSpec);
+  await writeJudgeRoundFile(outputDir, round.round, round.judge);
 
   if (round.userDecision) {
     await writeUserDecisionRoundFile(outputDir, round.round, round.userDecision);
   }
+}
+
+async function writeSkepticRoundFile(outputDir: string, round: number, skeptic: string) {
+  const prefix = `round-${String(round).padStart(2, "0")}`;
+  await writeFile(path.join(outputDir, `${prefix}-skeptic.md`), skeptic.trimEnd() + "\n", "utf8");
+}
+
+async function writeBuilderRoundFile(outputDir: string, round: number, revisedSpec: string) {
+  const prefix = `round-${String(round).padStart(2, "0")}`;
+  await writeFile(path.join(outputDir, `${prefix}-builder.md`), revisedSpec.trimEnd() + "\n", "utf8");
+}
+
+async function writeJudgeRoundFile(outputDir: string, round: number, judge: JudgeDecision) {
+  const prefix = `round-${String(round).padStart(2, "0")}`;
+  await writeFile(path.join(outputDir, `${prefix}-judge.json`), JSON.stringify(judge, null, 2) + "\n", "utf8");
+}
+
+async function writeFailureReport(
+  outputDir: string,
+  specPath: string,
+  message: string,
+  progress: DebateProgressTracker,
+) {
+  await writeFile(
+    path.join(outputDir, "failure.md"),
+    [
+      `# Spec Debate Failure: ${path.basename(specPath)}`,
+      "",
+      `- Source: ${specPath}`,
+      `- Failed after: ${formatElapsed(Date.now() - progress.startedAt)}`,
+      `- Current step: ${progress.current}`,
+      `- Error: ${message}`,
+      "",
+      "## Progress",
+      ...progress.lines.map((line) => `- ${line}`),
+      ...(progress.outputPreview.trim()
+        ? ["", `## Partial ${progress.outputLabel ?? "Model"} Output`, progress.outputPreview.trimEnd()]
+        : []),
+      "",
+    ].join("\n"),
+    "utf8",
+  );
 }
 
 async function writeUserDecisionRoundFile(outputDir: string, round: number, userDecision: UserDecisionState) {
@@ -1347,7 +1701,93 @@ function buildSummary(result: DebateRunResult): string {
     `Report: ${result.consensusPath}`,
     `Debate log: ${result.debatePath}`,
     ...(pendingQuestions.length > 0 ? [`Pending questions: ${pendingQuestions.length}`] : []),
+    "Expand this message to inspect the round-by-round debate.",
   ].join("\n");
+}
+
+function buildExpandedMessageDetails(details: Partial<DebateRunResult> & { error?: string }): string {
+  const lines: string[] = [];
+  const rounds = details.rounds ?? [];
+
+  if (details.error) lines.push(`Error: ${details.error}`);
+  if (details.outputDir) lines.push(`Output: ${details.outputDir}`);
+  if (details.status) lines.push(`Status: ${details.status}`);
+  lines.push(`Rounds: ${rounds.length}`);
+
+  if (details.finalSpecPath) lines.push(`Final spec: ${details.finalSpecPath}`);
+  if (details.consensusPath) lines.push(`Consensus report: ${details.consensusPath}`);
+  if (details.debatePath) lines.push(`Debate log: ${details.debatePath}`);
+
+  for (const round of rounds) {
+    const prefix = `round-${String(round.round).padStart(2, "0")}`;
+    lines.push(
+      "",
+      `## Round ${round.round}`,
+      "",
+      "### Skeptic",
+      round.skeptic || "(no critique captured)",
+      "",
+      "### Judge",
+      `- Consensus: ${round.judge.consensus}`,
+      `- Confidence: ${round.judge.confidence}`,
+      `- Summary: ${round.judge.summary || "No summary provided."}`,
+      `- Needs user input: ${round.judge.needsUserInput}`,
+    );
+
+    if (round.judge.userInputReason) {
+      lines.push(`- User input reason: ${round.judge.userInputReason}`);
+    }
+
+    lines.push(
+      ...(round.judge.mustFix.length ? ["- Must fix:", ...round.judge.mustFix.map((item) => `  - ${item}`)] : ["- Must fix: none"]),
+      ...(round.judge.niceToHave.length
+        ? ["- Nice to have:", ...round.judge.niceToHave.map((item) => `  - ${item}`)]
+        : ["- Nice to have: none"]),
+    );
+
+    if (round.judge.questions.length > 0) {
+      lines.push(
+        "- User questions:",
+        ...round.judge.questions.flatMap((question) => [
+          `  - [${question.area}] ${question.question}`,
+          question.whyItMatters ? `    - Why it matters: ${question.whyItMatters}` : "",
+        ]).filter(Boolean),
+      );
+    }
+
+    if (round.userDecision) {
+      lines.push(
+        "",
+        "### User Direction",
+        `- Answered: ${round.userDecision.answered}`,
+        `- Reason: ${round.userDecision.reason || "No reason provided."}`,
+      );
+
+      if (round.userDecision.responses.length > 0) {
+        lines.push(
+          "- Answers:",
+          ...round.userDecision.responses.map((response) => `  - [${response.area}] ${response.question}: ${response.answer}`),
+        );
+      }
+
+      if (round.userDecision.pendingQuestions.length > 0) {
+        lines.push(
+          "- Pending questions:",
+          ...round.userDecision.pendingQuestions.map((question) => `  - [${question.area}] ${question.question}`),
+        );
+      }
+    }
+
+    lines.push(
+      "",
+      "### Builder",
+      `Saved full revised draft to: ${details.outputDir ? path.join(details.outputDir, `${prefix}-builder.md`) : `${prefix}-builder.md`}`,
+      "",
+      round.revisedSpec.trimEnd() || "(no revised draft captured)",
+    );
+  }
+
+  return lines.join("\n");
 }
 
 function getPendingUserQuestions(rounds: DebateRound[]): UserDecisionQuestion[] {
